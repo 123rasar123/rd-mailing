@@ -1,0 +1,4 @@
+users.db
+sessions/
+qr_codes/
+.env
