@@ -10,11 +10,12 @@ from telethon.errors import (
     PhoneCodeInvalidError, 
     PhoneNumberInvalidError,
     ApiIdInvalidError,
-    PasswordHashInvalidError # <--- ДОБАВЛЕНА ОБРАБОТКА НЕВЕРНОГО ПАРОЛЯ
+    PasswordHashInvalidError
 )
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# ⚠️ Если 2040 не работает, попробуй 2496 или получи свои на my.telegram.org ⚠️
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
@@ -166,7 +167,6 @@ async def sign_in(user_id, phone, code, code_hash):
         return {"status": "error", "msg": str(e)}
 
 
-# --- ВХОД ПО 2FA ПАРОЛЮ (ОТДЕЛЬНО ДЛЯ НОМЕРА И QR) ---
 async def sign_in_2fa_phone(user_id, password):
     client = active_clients.get(user_id)
     try:
@@ -209,7 +209,6 @@ async def check_qr(user_id):
     if not qr_login: 
         return {"status": "error", "msg": "Сессия истекла"}
     try:
-        # Ждем 3 секунды, чтобы не спамить Telegram
         await asyncio.wait_for(qr_login.wait(), timeout=3.0)
         return {"status": "ok"}
     except asyncio.TimeoutError:

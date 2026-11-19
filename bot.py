@@ -37,6 +37,7 @@ dp = Dispatcher()
 # БАЗА
 # ==========================================
 conn = sqlite3.connect("users.db")
+conn.row_factory = sqlite3.Row  # <--- ДОБАВЛЕНО ДЛЯ ДОСТУПА ПО ИМЕНИ СТОЛБЦА
 cursor = conn.cursor()
 cursor.execute("""CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY, sub1 INTEGER DEFAULT 0, sub2 INTEGER DEFAULT 0,
@@ -49,6 +50,14 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS posts (
 cursor.execute("""CREATE TABLE IF NOT EXISTS user_groups (
     group_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, chat_link TEXT, type TEXT
 )""")
+
+# МИГРАЦИЯ БАЗЫ
+cursor.execute("PRAGMA table_info(users)")
+columns = [column[1] for column in cursor.fetchall()]
+if "sub1" not in columns:
+    cursor.execute("ALTER TABLE users ADD COLUMN sub1 INTEGER DEFAULT 0")
+if "sub2" not in columns:
+    cursor.execute("ALTER TABLE users ADD COLUMN sub2 INTEGER DEFAULT 0")
 conn.commit()
 
 
@@ -58,7 +67,7 @@ def get_user(user_id):
     if not row:
         cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-        return (user_id, 0, 0, 'Нет', 0, 0)
+        return {"user_id": user_id, "sub1": 0, "sub2": 0, "tariff": 'Нет', "limit_msg": 0, "limit_search": 0}
     return row
 
 
@@ -158,7 +167,7 @@ def get_main_menu(user_id):
         [InlineKeyboardButton(text="🛒 Тарифы", callback_data="tariffs", style="primary"),
          InlineKeyboardButton(text="👤 Профиль", callback_data="profile", style="primary")],
     ]
-    if user[3] == 'Нет':
+    if user["tariff"] == 'Нет':
         buttons.append([InlineKeyboardButton(text="🎁 Тест-драйв (75 сообщений)", callback_data="test_drive", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -181,12 +190,12 @@ def get_tariffs_kb():
 
 
 def get_main_menu_text(user):
-    active = mailer.count_user_broadcasts(user[0])
+    active = mailer.count_user_broadcasts(user["user_id"])
     stats = f"\n🚀 Активных рассылок: <b>{active}</b>" if active > 0 else ""
     return (
         f"<b>RD Mailing</b> — твой инструмент для автоматизации Telegram.\n\n"
-        f"💎 Тариф: <b>{user[3]}</b>\n"
-        f"📨 Осталось сообщений: <b>{user[4]}</b>"
+        f"💎 Тариф: <b>{user['tariff']}</b>\n"
+        f"📨 Осталось сообщений: <b>{user['limit_msg']}</b>"
         f"{stats}\n\n"
         f"<i>Выбери действие ниже:</i>"
     )
@@ -222,7 +231,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user = get_user(message.from_user.id)
     user_id = message.from_user.id
     
-    if user[1] == 1:
+    if user["sub1"] == 1:
         caption = get_main_menu_text(user)
         try:
             await message.answer_photo(URL_MENU, caption=caption, reply_markup=get_main_menu(user_id), parse_mode="HTML")
@@ -275,7 +284,7 @@ async def back_menu(callback: types.CallbackQuery, state: FSMContext):
 
 
 # ==========================================
-# АВТОРИЗАЦИЯ АККАУНТА
+# АВТОРИЗАЦИЯ АККАУНТА (ВЫБОР СПОСОБА)
 # ==========================================
 @dp.callback_query(F.data.startswith("auth_start"))
 async def auth_start_cb(callback: types.CallbackQuery, state: FSMContext):
@@ -534,11 +543,12 @@ async def auth_code(message: types.Message, state: FSMContext):
 
 
 # ==========================================
-# QR АВТОРИЗАЦИЯ (С КНОПКАМИ)
+# QR АВТОРИЗАЦИЯ
 # ==========================================
 @dp.callback_query(F.data == "auth_method_qr")
 async def auth_method_qr(callback: types.CallbackQuery, state: FSMContext):
     await generate_and_send_qr(callback.message.chat.id, callback.from_user.id, state)
+
 
 async def generate_and_send_qr(chat_id, user_id, state: FSMContext):
     await bot.send_chat_action(chat_id, action="upload_photo")
@@ -560,15 +570,16 @@ async def generate_and_send_qr(chat_id, user_id, state: FSMContext):
         await state.update_data(auth_msg_id=new_msg.message_id)
         await state.set_state(BotStates.auth_qr_scan)
         
-        # Запускаем фоновую задачу для авто-проверки
         asyncio.create_task(check_qr_status(user_id, chat_id, state))
     else:
         await bot.send_message(chat_id, f"❌ Ошибка генерации QR: {res['msg']}")
+
 
 @dp.callback_query(F.data == "qr_refresh")
 async def qr_refresh(callback: types.CallbackQuery, state: FSMContext):
     await safe_delete(callback.message)
     await generate_and_send_qr(callback.message.chat.id, callback.from_user.id, state)
+
 
 @dp.callback_query(F.data == "qr_check")
 async def qr_check(callback: types.CallbackQuery, state: FSMContext):
@@ -581,8 +592,8 @@ async def qr_check(callback: types.CallbackQuery, state: FSMContext):
     else:
         await callback.answer("Еще не отсканировано или QR устарел.", show_alert=True)
 
+
 async def check_qr_status(user_id, chat_id, state: FSMContext):
-    # Ждем 30 секунд (10 раз по 3 секунды)
     for _ in range(10):
         await asyncio.sleep(3)
         res = await mailer.check_qr(user_id)
@@ -598,6 +609,7 @@ async def check_qr_status(user_id, chat_id, state: FSMContext):
                 return
     await bot.send_message(chat_id, "⏳ <b>Время действия QR-кода истекло.</b>\n\nНажмите «🔄 Обновить QR-код», если хотите попробовать снова.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить QR-код", callback_data="qr_refresh", style="primary")]]))
 
+
 async def handle_qr_success(chat_id, user_id, state: FSMContext):
     data = await state.get_data()
     msg_id = data.get("auth_msg_id")
@@ -606,6 +618,7 @@ async def handle_qr_success(chat_id, user_id, state: FSMContext):
     await bot.send_message(chat_id, "✅ <b>Аккаунт успешно подключен!</b>", reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
     await handle_auth_success(user_id, state)
     await bot.send_message(chat_id, "🏠 Возвращайтесь в меню", reply_markup=get_back_kb(), parse_mode="HTML")
+
 
 async def handle_qr_2fa(chat_id, user_id, state: FSMContext):
     data = await state.get_data()
@@ -618,7 +631,7 @@ async def handle_qr_2fa(chat_id, user_id, state: FSMContext):
 
 
 # ==========================================
-# ВВОД 2FA ПАРОЛЯ (ИСПРАВЛЕН БАГ)
+# ВВОД 2FA ПАРОЛЯ
 # ==========================================
 @dp.message(BotStates.auth_2fa)
 async def auth_2fa(message: types.Message, state: FSMContext):
@@ -689,15 +702,13 @@ async def auth_2fa(message: types.Message, state: FSMContext):
         )
         await state.update_data(auth_msg_id=new_msg.message_id)
 
+
 @dp.callback_query(F.data == "auth_retry_2fa")
 async def auth_retry_2fa(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("🔐 <b>Введите ваш пароль 2FA:</b>", parse_mode="HTML")
     await state.set_state(BotStates.auth_2fa)
 
 
-# ==========================================
-# УСПЕШНЫЙ ВХОД
-# ==========================================
 async def handle_auth_success(user_id, state: FSMContext):
     data = await state.get_data()
     is_td = data.get("td_after_auth", False)
@@ -705,7 +716,7 @@ async def handle_auth_success(user_id, state: FSMContext):
 
     if is_td:
         user = get_user(user_id)
-        if user[3] == "Нет":
+        if user["tariff"] == "Нет":
             cursor.execute("UPDATE users SET tariff = 'Тест', limit_msg = 75, limit_search = 1 WHERE user_id = ?", (user_id,))
             conn.commit()
             try:
@@ -737,11 +748,11 @@ async def _render_profile(callback_or_msg, state: FSMContext = None):
         f"<blockquote>"
         f"👤 Имя: <b>{callback_or_msg.from_user.first_name}</b>\n"
         f"🔗 Юзернейм: <b>{username}</b>\n"
-        f"🆔 ID: <code>{user[0]}</code>\n"
+        f"🆔 ID: <code>{user['user_id']}</code>\n"
         f"📱 Аккаунт TG: <b>{auth_status}</b>\n"
-        f"💎 Тариф: <b>{user[3]}</b>\n"
-        f"📨 Осталось сообщений: <b>{user[4]}</b>\n"
-        f"🕵️‍♂️ Осталось поисков: <b>{user[5]}</b>\n"
+        f"💎 Тариф: <b>{user['tariff']}</b>\n"
+        f"📨 Осталось сообщений: <b>{user['limit_msg']}</b>\n"
+        f"🕵️‍♂️ Осталось поисков: <b>{user['limit_search']}</b>\n"
         f"🚀 Активных рассылок: <b>{active}</b>"
         f"</blockquote>\n\n"
         f"🛠 <b>Тех. поддержка:</b> @Rendertim"
@@ -800,7 +811,7 @@ async def process_promo(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "test_drive")
 async def test_drive(callback: types.CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
-    if user[3] != "Нет":
+    if user["tariff"] != "Нет":
         return await callback.answer("Вы уже активировали тест!", show_alert=True)
     
     if not await mailer.is_authorized(callback.from_user.id):
@@ -812,7 +823,7 @@ async def test_drive(callback: types.CallbackQuery, state: FSMContext):
             parse_mode="HTML"
         )
 
-    cursor.execute("UPDATE users SET tariff = 'Тест', limit_msg = 75, limit_search = 1 WHERE user_id = ?", (user[0],))
+    cursor.execute("UPDATE users SET tariff = 'Тест', limit_msg = 75, limit_search = 1 WHERE user_id = ?", (user["user_id"],))
     conn.commit()
     try:
         await bot.send_dice(chat_id=callback.from_user.id, emoji="🎰")
@@ -973,8 +984,8 @@ async def my_posts(callback: types.CallbackQuery):
     posts = cursor.fetchall()
     kb = []
     for p in posts:
-        title = p[1] if p[1] else "Без названия"
-        kb.append([InlineKeyboardButton(text=f"📄 {title}", callback_data=f"post_view_{p[0]}")])
+        title = p["title"] if p["title"] else "Без названия"
+        kb.append([InlineKeyboardButton(text=f"📄 {title}", callback_data=f"post_view_{p['post_id']}")])
     kb.append([InlineKeyboardButton(text="➕ Добавить пост", callback_data="post_add", style="success")])
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_menu", style="danger")])
     text = "📚 <b>Мои посты</b>\n\nЗдесь хранятся ваши готовые сообщения." if posts else "📚 <b>Мои посты</b>\n\nУ вас пока нет сохранённых постов."
@@ -1047,10 +1058,10 @@ async def post_view(callback: types.CallbackQuery):
     p = cursor.fetchone()
     kb = [[InlineKeyboardButton(text="🗑 Удалить пост", callback_data=f"post_del_{post_id}", style="danger")],
           [InlineKeyboardButton(text="🔙 Назад к постам", callback_data="my_posts", style="danger")]]
-    title = p[0] if p[0] else "Без названия"
-    text = p[1] if p[1] else ""
-    file_id = p[2]
-    media_type = p[3]
+    title = p["title"] if p["title"] else "Без названия"
+    text = p["text_content"] if p["text_content"] else ""
+    file_id = p["media_file_id"]
+    media_type = p["media_type"]
     caption = f"📄 <b>{title}</b>\n\n{text}" if text else f"📄 <b>{title}</b>"
     await safe_delete(callback.message)
     if file_id:
@@ -1082,7 +1093,7 @@ async def my_groups(callback: types.CallbackQuery):
     groups = cursor.fetchall()
     kb = []
     for g in groups:
-        kb.append([InlineKeyboardButton(text=f"🔗 {g[1]}", callback_data=f"group_view_{g[0]}")])
+        kb.append([InlineKeyboardButton(text=f"🔗 {g['title']}", callback_data=f"group_view_{g['group_id']}")])
     kb.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="group_add", style="success")])
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_menu", style="danger")])
     text = "📋 <b>Мои группы</b>\n\nЗдесь хранятся ваши списки ссылок." if groups else "📋 <b>Мои группы</b>\n\nУ вас пока нет сохранённых групп."
@@ -1117,7 +1128,7 @@ async def group_view(callback: types.CallbackQuery):
     g = cursor.fetchone()
     kb = [[InlineKeyboardButton(text="🗑 Удалить группу", callback_data=f"group_del_{group_id}", style="danger")],
           [InlineKeyboardButton(text="🔙 Назад к группам", callback_data="my_groups", style="danger")]]
-    text = f"🔗 <b>{g[0]}</b>\n\n<code>{g[1]}</code>"
+    text = f"🔗 <b>{g['title']}</b>\n\n<code>{g['chat_link']}</code>"
     await edit_menu(callback, URL_MENU, text, InlineKeyboardMarkup(inline_keyboard=kb))
 
 
@@ -1136,7 +1147,7 @@ async def group_delete(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "new_campaign")
 async def new_campaign(callback: types.CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
-    if user[4] <= 0:
+    if user["limit_msg"] <= 0:
         return await callback.answer("❌ У вас закончились сообщения! Купите тариф.", show_alert=True)
     if mailer.count_user_broadcasts(callback.from_user.id) >= mailer.MAX_BROADCASTS_PER_USER:
         return await callback.answer(f"⚠️ Максимум {mailer.MAX_BROADCASTS_PER_USER} одновременных рассылок!", show_alert=True)
@@ -1153,8 +1164,8 @@ async def new_campaign(callback: types.CallbackQuery, state: FSMContext):
 
     kb = []
     for p in posts:
-        title = p[1] if p[1] else "Без названия"
-        kb.append([InlineKeyboardButton(text=f"📄 {title}", callback_data=f"camp_post_{p[0]}")])
+        title = p["title"] if p["title"] else "Без названия"
+        kb.append([InlineKeyboardButton(text=f"📄 {title}", callback_data=f"camp_post_{p['post_id']}")])
     kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="back_menu", style="danger")])
     msg = await callback.message.answer(
         campaign_card(1, 5, "Выберите пост", "Какой пост будем рассылать?"),
@@ -1167,7 +1178,7 @@ async def campaign_post_selected(callback: types.CallbackQuery, state: FSMContex
     post_id = int(callback.data.split("_")[2])
     cursor.execute("SELECT media_msg_id FROM posts WHERE post_id = ?", (post_id,))
     result = cursor.fetchone()
-    telegram_msg_id = result[0] if result else 0
+    telegram_msg_id = result["media_msg_id"] if result else 0
     await state.update_data(camp_post_id=telegram_msg_id, selected_groups=[])
 
     cursor.execute("SELECT group_id, title FROM user_groups WHERE user_id = ?", (callback.from_user.id,))
@@ -1177,7 +1188,7 @@ async def campaign_post_selected(callback: types.CallbackQuery, state: FSMContex
 
     kb = []
     for g in groups:
-        kb.append([InlineKeyboardButton(text=f"⬜ {g[1]}", callback_data=f"camp_toggle_{g[0]}")])
+        kb.append([InlineKeyboardButton(text=f"⬜ {g['title']}", callback_data=f"camp_toggle_{g['group_id']}")])
     kb.append([InlineKeyboardButton(text="🚀 Запустить выбранные", callback_data="camp_start_selected", style="success")])
     kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="back_menu", style="danger")])
     await callback.message.edit_text(
@@ -1202,8 +1213,8 @@ async def campaign_toggle_group(callback: types.CallbackQuery, state: FSMContext
     groups = cursor.fetchall()
     kb = []
     for g in groups:
-        icon = "✅" if g[0] in selected else "⬜"
-        kb.append([InlineKeyboardButton(text=f"{icon} {g[1]}", callback_data=f"camp_toggle_{g[0]}")])
+        icon = "✅" if g["group_id"] in selected else "⬜"
+        kb.append([InlineKeyboardButton(text=f"{icon} {g['title']}", callback_data=f"camp_toggle_{g['group_id']}")])
     kb.append([InlineKeyboardButton(text=f"🚀 Запустить выбранные ({len(selected)})", callback_data="camp_start_selected", style="success")])
     kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="back_menu", style="danger")])
     await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -1221,7 +1232,7 @@ async def campaign_start_selected(callback: types.CallbackQuery, state: FSMConte
     links = cursor.fetchall()
     all_links = []
     for l in links:
-        all_links.extend(l[0].split(','))
+        all_links.extend(l["chat_link"].split(','))
     combined_links = ",".join([link.strip() for link in all_links])
     total_chats = len(all_links)
     await state.update_data(camp_group_value=combined_links, total_chats=total_chats)
@@ -1337,7 +1348,7 @@ async def run_campaign_task(user_id, broadcast_id, post_id, target_data,
                 f"🏁 <b>Рассылка завершена</b>\n\n"
                 f"✅ Отправлено: <b>{total_sent}</b>\n"
                 f"❌ Ошибок: <b>{res['fail']}</b>\n"
-                f"📨 Остаток: <b>{user[4]}</b>{error_text}",
+                f"📨 Остаток: <b>{user['limit_msg']}</b>{error_text}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
                 parse_mode="HTML")
         else:
@@ -1384,13 +1395,13 @@ async def callback_stop(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "parser")
 async def start_parser(callback: types.CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
-    if user[5] <= 0:
+    if user["limit_search"] <= 0:
         return await callback.answer("❌ У вас закончились поиски! Купите тариф.", show_alert=True)
     if not await mailer.is_authorized(callback.from_user.id):
         return await callback.answer("Сначала подключите аккаунт!", show_alert=True)
     await safe_delete(callback.message)
     await send_step(callback.message.chat.id, state,
-                    f"🕵️‍♂️ <b>Поиск чатов</b>\n\nВведите ключевое слово.\n<i>Доступно поисков: <b>{user[5]}</b></i>", kb=get_cancel_kb())
+                    f"🕵️‍♂️ <b>Поиск чатов</b>\n\nВведите ключевое слово.\n<i>Доступно поисков: <b>{user['limit_search']}</b></i>", kb=get_cancel_kb())
     await state.set_state(BotStates.parser_keyword)
 
 
@@ -1409,7 +1420,7 @@ async def process_parser(message: types.Message, state: FSMContext):
         user = get_user(message.from_user.id)
         text = ("✅ <b>Найденные группы:</b>\n\n" +
                 "\n".join([f"• {c}" for c in chats]) +
-                f"\n\n🕵️‍♂️ Осталось поисков: <b>{user[5]}</b>")
+                f"\n\n🕵️‍♂️ Осталось поисков: <b>{user['limit_search']}</b>")
         await edit_step(message.chat.id, state, text, kb=get_back_kb())
     else:
         await edit_step(message.chat.id, state, f"❌ <b>Ошибка:</b> {res['msg']}", kb=get_back_kb())
@@ -1459,7 +1470,7 @@ async def do_admin_broadcast(message: types.Message, state: FSMContext):
     success = 0
     for u in users:
         try:
-            await bot.send_message(u[0], message.text); success += 1
+            await bot.send_message(u["user_id"], message.text); success += 1
         except:
             pass
     await message.answer(f"✅ Отправлено: {success}")
