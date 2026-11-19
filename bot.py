@@ -254,7 +254,6 @@ async def check_sub1(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "back_menu")
 async def back_menu(callback: types.CallbackQuery, state: FSMContext):
-    # Очистка QR-логинов и файлов
     if callback.from_user.id in mailer.qr_logins:
         del mailer.qr_logins[callback.from_user.id]
     qr_file = f"qr_codes/qr_{callback.from_user.id}.png"
@@ -276,7 +275,7 @@ async def back_menu(callback: types.CallbackQuery, state: FSMContext):
 
 
 # ==========================================
-# АВТОРИЗАЦИЯ АККАУНТА (ВЫБОР СПОСОБА)
+# АВТОРИЗАЦИЯ АККАУНТА
 # ==========================================
 @dp.callback_query(F.data.startswith("auth_start"))
 async def auth_start_cb(callback: types.CallbackQuery, state: FSMContext):
@@ -513,7 +512,7 @@ async def auth_code(message: types.Message, state: FSMContext):
             ),
             parse_mode="HTML"
         )
-        await state.update_data(auth_msg_id=new_msg.message_id)
+        await state.update_data(auth_method="phone", auth_msg_id=new_msg.message_id)
         await state.set_state(BotStates.auth_2fa)
     else:
         await safe_delete(msg)
@@ -535,98 +534,92 @@ async def auth_code(message: types.Message, state: FSMContext):
 
 
 # ==========================================
-# QR АВТОРИЗАЦИЯ
+# QR АВТОРИЗАЦИЯ (С КНОПКАМИ)
 # ==========================================
 @dp.callback_query(F.data == "auth_method_qr")
 async def auth_method_qr(callback: types.CallbackQuery, state: FSMContext):
-    await safe_delete(callback.message)
-    msg = await callback.message.answer("⏳ Генерирую QR-код...")
-    
-    res = await mailer.get_qr(callback.from_user.id)
+    await generate_and_send_qr(callback.message.chat.id, callback.from_user.id, state)
+
+async def generate_and_send_qr(chat_id, user_id, state: FSMContext):
+    await bot.send_chat_action(chat_id, action="upload_photo")
+    res = await mailer.get_qr(user_id)
     if res["status"] == "ok":
-        await safe_delete(msg)
         caption = (
             "📷 <b>Вход по QR-коду</b>\n\n"
             "1. Откройте Telegram на телефоне.\n"
             "2. Перейдите в <b>Настройки → Устройства → Подключить устройство</b>.\n"
             "3. Наведите камеру на этот QR-код.\n\n"
-            "<i>Ожидаю подтверждения (2 минуты)...</i>"
+            "<i>QR-код действует 30 секунд. Если не успели — нажмите «Обновить».</i>"
         )
-        new_msg = await callback.message.answer_photo(FSInputFile(res["path"]), caption=caption, parse_mode="HTML")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить QR-код", callback_data="qr_refresh", style="primary")],
+            [InlineKeyboardButton(text="✅ Я отсканировал / Проверить", callback_data="qr_check", style="success")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="back_menu", style="danger")]
+        ])
+        new_msg = await bot.send_photo(chat_id, FSInputFile(res["path"]), caption=caption, reply_markup=kb, parse_mode="HTML")
         await state.update_data(auth_msg_id=new_msg.message_id)
         await state.set_state(BotStates.auth_qr_scan)
         
-        # Запускаем фоновую задачу для проверки сканирования
-        asyncio.create_task(check_qr_status(callback.from_user.id, callback.message.chat.id, state))
+        # Запускаем фоновую задачу для авто-проверки
+        asyncio.create_task(check_qr_status(user_id, chat_id, state))
     else:
-        await msg.edit_text(f"❌ Ошибка генерации QR: {res['msg']}")
+        await bot.send_message(chat_id, f"❌ Ошибка генерации QR: {res['msg']}")
 
+@dp.callback_query(F.data == "qr_refresh")
+async def qr_refresh(callback: types.CallbackQuery, state: FSMContext):
+    await safe_delete(callback.message)
+    await generate_and_send_qr(callback.message.chat.id, callback.from_user.id, state)
+
+@dp.callback_query(F.data == "qr_check")
+async def qr_check(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("Проверяю...")
+    res = await mailer.check_qr(callback.from_user.id)
+    if res["status"] == "ok":
+        await handle_qr_success(callback.message.chat.id, callback.from_user.id, state)
+    elif res["status"] == "2fa":
+        await handle_qr_2fa(callback.message.chat.id, callback.from_user.id, state)
+    else:
+        await callback.answer("Еще не отсканировано или QR устарел.", show_alert=True)
 
 async def check_qr_status(user_id, chat_id, state: FSMContext):
-    attempts = 0
-    qr_file_path = f"qr_codes/qr_{user_id}.png"
-    
-    while attempts < 40: # Ждем 120 секунд (40 * 3)
-        res = await mailer.check_qr(user_id)
-        
-        if res["status"] == "ok":
-            # Удаляем картинку с диска
-            if os.path.exists(qr_file_path):
-                try: os.remove(qr_file_path)
-                except: pass
-            
-            # Удаляем сообщение с QR-кодом из чата
-            data = await state.get_data()
-            msg_id = data.get("auth_msg_id")
-            if msg_id:
-                await delete_msg_id(chat_id, msg_id)
-
-            await bot.send_message(chat_id, "✅ <b>Аккаунт успешно подключен!</b>", reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
-            await handle_auth_success(user_id, state)
-            await bot.send_message(chat_id, "🏠 Возвращайтесь в меню", reply_markup=get_back_kb(), parse_mode="HTML")
-            return
-            
-        elif res["status"] == "2fa":
-            if os.path.exists(qr_file_path):
-                try: os.remove(qr_file_path)
-                except: pass
-                
-            data = await state.get_data()
-            msg_id = data.get("auth_msg_id")
-            if msg_id:
-                await delete_msg_id(chat_id, msg_id)
-
-            await state.update_data(auth_method="qr")
-            await bot.send_message(chat_id, "🔐 <b>Включена 2FA.</b>\n\nВведите ваш пароль 2FA:", parse_mode="HTML")
-            await state.set_state(BotStates.auth_2fa)
-            return
-            
-        elif res["status"] == "error":
-            if os.path.exists(qr_file_path):
-                try: os.remove(qr_file_path)
-                except: pass
-                
-            if "устарел" in res["msg"]:
-                kb = [[InlineKeyboardButton(text="🔄 Обновить QR-код", callback_data="auth_method_qr", style="primary")]]
-                await bot.send_message(chat_id, "⏳ <b>Время действия QR-кода истекло.</b>\n\nНажмите кнопку ниже, чтобы сгенерировать новый:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
-                await state.clear()
-                return
-            else:
-                await bot.send_message(chat_id, f"❌ Ошибка: {res['msg']}. Попробуйте снова.")
-                await state.clear()
-                return
-                
+    # Ждем 30 секунд (10 раз по 3 секунды)
+    for _ in range(10):
         await asyncio.sleep(3)
-        attempts += 1
-        
-    if os.path.exists(qr_file_path):
-        try: os.remove(qr_file_path)
-        except: pass
+        res = await mailer.check_qr(user_id)
+        if res["status"] == "ok":
+            await handle_qr_success(chat_id, user_id, state)
+            return
+        elif res["status"] == "2fa":
+            await handle_qr_2fa(chat_id, user_id, state)
+            return
+        elif res["status"] in ["error", "expired"]:
+            if "устарел" in res["msg"]:
+                await bot.send_message(chat_id, "⏳ <b>Время действия QR-кода истекло.</b>\n\nНажмите кнопку «🔄 Обновить QR-код».", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить QR-код", callback_data="qr_refresh", style="primary")]]))
+                return
+    await bot.send_message(chat_id, "⏳ <b>Время действия QR-кода истекло.</b>\n\nНажмите «🔄 Обновить QR-код», если хотите попробовать снова.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Обновить QR-код", callback_data="qr_refresh", style="primary")]]))
 
-    await bot.send_message(chat_id, "⏳ <b>Время ожидания истекло.</b>\n\nПопробуйте снова.", reply_markup=get_back_kb())
-    await state.clear()
+async def handle_qr_success(chat_id, user_id, state: FSMContext):
+    data = await state.get_data()
+    msg_id = data.get("auth_msg_id")
+    if msg_id:
+        await delete_msg_id(chat_id, msg_id)
+    await bot.send_message(chat_id, "✅ <b>Аккаунт успешно подключен!</b>", reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
+    await handle_auth_success(user_id, state)
+    await bot.send_message(chat_id, "🏠 Возвращайтесь в меню", reply_markup=get_back_kb(), parse_mode="HTML")
+
+async def handle_qr_2fa(chat_id, user_id, state: FSMContext):
+    data = await state.get_data()
+    msg_id = data.get("auth_msg_id")
+    if msg_id:
+        await delete_msg_id(chat_id, msg_id)
+    await state.update_data(auth_method="qr")
+    await bot.send_message(chat_id, "🔐 <b>Включена 2FA.</b>\n\nВведите ваш пароль 2FA:", parse_mode="HTML")
+    await state.set_state(BotStates.auth_2fa)
 
 
+# ==========================================
+# ВВОД 2FA ПАРОЛЯ (ИСПРАВЛЕН БАГ)
+# ==========================================
 @dp.message(BotStates.auth_2fa)
 async def auth_2fa(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
@@ -660,7 +653,6 @@ async def auth_2fa(message: types.Message, state: FSMContext):
 
     password = message.text.strip()
     data = await state.get_data()
-    phone = data.get("auth_phone")
     method = data.get("auth_method", "phone")
 
     await safe_delete(message)
@@ -674,7 +666,7 @@ async def auth_2fa(message: types.Message, state: FSMContext):
         if method == "qr":
             res = await mailer.sign_in_2fa_qr(message.from_user.id, password)
         else:
-            res = await asyncio.wait_for(mailer.sign_in(message.from_user.id, phone, "", None, password), timeout=20)
+            res = await mailer.sign_in_2fa_phone(message.from_user.id, password)
     except asyncio.TimeoutError:
         res = {"status": "error", "msg": "Превышено время ожидания."}
     except Exception as e:
@@ -688,13 +680,24 @@ async def auth_2fa(message: types.Message, state: FSMContext):
     else:
         await safe_delete(msg)
         new_msg = await message.answer(
-            f"❌ <b>Неверный пароль 2FA.</b>\n\n{res['msg']}\n\nПопробуйте снова:",
-            reply_markup=ReplyKeyboardRemove(),
+            f"❌ <b>Ошибка:</b> {res['msg']}\n\nПопробуйте снова:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="auth_retry_2fa", style="primary")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="back_menu", style="danger")]
+            ]),
             parse_mode="HTML"
         )
         await state.update_data(auth_msg_id=new_msg.message_id)
 
+@dp.callback_query(F.data == "auth_retry_2fa")
+async def auth_retry_2fa(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("🔐 <b>Введите ваш пароль 2FA:</b>", parse_mode="HTML")
+    await state.set_state(BotStates.auth_2fa)
 
+
+# ==========================================
+# УСПЕШНЫЙ ВХОД
+# ==========================================
 async def handle_auth_success(user_id, state: FSMContext):
     data = await state.get_data()
     is_td = data.get("td_after_auth", False)

