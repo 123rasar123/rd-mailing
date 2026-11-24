@@ -2,6 +2,7 @@ import asyncio
 import os
 import uuid
 import qrcode
+import random
 from telethon import TelegramClient, functions
 from telethon.errors import (
     SessionPasswordNeededError, 
@@ -10,7 +11,11 @@ from telethon.errors import (
     PhoneCodeInvalidError, 
     PhoneNumberInvalidError,
     ApiIdInvalidError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    ChatWriteForbiddenError,
+    UserBannedInChannelError,
+    ChannelPrivateError,
+    SlowModeWaitError
 )
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -125,6 +130,8 @@ async def get_client(user_id):
         device_model="iPhone 14 Pro", system_version="iOS 16.5",
         app_version="9.6.3", lang_code="ru", system_lang_code="ru-RU"
     )
+    # Отключаем автоматическое ожидание, чтобы контролировать его вручную
+    client.flood_sleep_threshold = 0 
     await client.connect()
     active_clients[user_id] = client
     return client
@@ -227,7 +234,7 @@ async def check_qr(user_id):
 
 
 async def get_chats_from_folder(user_id, folder_name):
-    """Берет чаты из папки Telegram (Dialog Filters)"""
+    """Берет чаты из папки Telegram (Dialog Filters) с защитой от FloodWait"""
     client = active_clients.get(user_id)
     if not client or not await client.is_user_authorized():
         return {"status": "error", "msg": "Аккаунт не подключен"}
@@ -239,27 +246,25 @@ async def get_chats_from_folder(user_id, folder_name):
             return {"status": "error", "msg": f"Папка '{folder_name}' не найдена. Создайте её в Telegram."}
         
         found_chats = []
-        # Берем до 100 чатов из папки
         for peer in target.include_peers[:100]:
+            await asyncio.sleep(random.uniform(1.5, 3.5)) # Микро-пауза
             try:
                 entity = await client.get_entity(peer)
-                
-                # Если есть юзернейм - берем его
                 if hasattr(entity, 'username') and entity.username:
                     found_chats.append(f"@{entity.username}")
-                # Если приватный - пытаемся получить инвайт-ссылку
                 elif hasattr(entity, 'id'):
                     try:
                         invite = await client(functions.messages.ExportChatInviteRequest(peer=entity))
                         found_chats.append(invite.link)
                     except Exception:
-                        # Если нельзя получить ссылку (например, мы не админ) - пропускаем
                         pass
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 2)
             except Exception:
                 pass
                 
         if not found_chats:
-            return {"status": "error", "msg": "В папке не найдено доступных чатов (ни публичных, ни с инвайт-ссылками)."}
+            return {"status": "error", "msg": "В папке не найдено доступных чатов."}
             
         return {"status": "ok", "chats": found_chats}
     except Exception as e:
@@ -312,23 +317,24 @@ async def run_campaign(user_id, broadcast_id, post_msg_id, target_data,
     active_broadcasts.setdefault(user_id, {})[broadcast_id] = state
 
     try:
+        # 1. Безопасный сбор сущностей (с задержками и кэшированием)
         entities = []
-        # Безопасный сбор сущностей
-        for link in target_data["value"].split(','):
-            link = link.strip()
-            if not link:
-                continue
+        links = [l.strip() for l in target_data["value"].split(',') if l.strip()]
+        
+        for link in links:
+            await asyncio.sleep(random.uniform(1.5, 3.5)) # Микро-пауза
             try:
-                # Пытаемся найти чат
                 entity = await client.get_entity(link)
                 entities.append(entity)
-            except Exception as e:
-                # Если чат не найден или битая ссылка - просто пропускаем
-                print(f"Не удалось найти чат {link}: {e}")
-                pass
-                
+            except FloodWaitError as e:
+                state["data"]["last_error"] = f"⏳ Ожидание {e.seconds}с (FloodWait)"
+                await render_progress(user_id, broadcast_id)
+                await asyncio.sleep(e.seconds + 2)
+            except Exception:
+                pass # Битая ссылка, пропускаем
+
         if not entities:
-            return {"status": "error", "msg": "Не удалось найти ни одного чата из списка. Возможно, ссылки битые или чаты приватные."}
+            return {"status": "error", "msg": "Не удалось найти ни одного чата из списка."}
 
         total_success = 0
         total_fail = 0
@@ -346,16 +352,27 @@ async def run_campaign(user_id, broadcast_id, post_msg_id, target_data,
         for round_num in range(rounds):
             for entity in entities:
                 try:
-                    await client.forward_messages(entity, orig_msg, drop_author=True)
+                    # 2. Эмуляция живого пользователя (статус "печатает")
+                    async with client.action(entity, 'typing'):
+                        await asyncio.sleep(random.uniform(2.0, 4.5))
+                    
+                    # 3. Отправка с отключенным превью ссылок
+                    await client.send_message(entity, orig_msg.text, link_preview=False)
                     total_success += 1
                 except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds + 1)
+                    state["data"]["last_error"] = f"⏳ Ожидание {e.seconds}с (FloodWait)"
+                    await render_progress(user_id, broadcast_id)
+                    await asyncio.sleep(e.seconds + 5)
                     try:
-                        await client.forward_messages(entity, orig_msg, drop_author=True)
+                        await client.send_message(entity, orig_msg.text, link_preview=False)
                         total_success += 1
                     except Exception as e2:
                         total_fail += 1
                         last_error = _humanize_error(e2)
+                except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError, SlowModeWaitError) as e:
+                    # 4. Мгновенный пропуск проблемных чатов
+                    total_fail += 1
+                    last_error = _humanize_error(e)
                 except Exception as e:
                     total_fail += 1
                     last_error = _humanize_error(e)
@@ -371,8 +388,10 @@ async def run_campaign(user_id, broadcast_id, post_msg_id, target_data,
                 }
                 await render_progress(user_id, broadcast_id)
 
+                # 5. Рандомизация паузы (jitter ±25%)
                 if delay_between_chats > 0:
-                    await asyncio.sleep(delay_between_chats)
+                    jitter = random.uniform(0.75, 1.25)
+                    await asyncio.sleep(delay_between_chats * jitter)
             if round_num < rounds - 1:
                 await asyncio.sleep(delay_between_rounds)
 

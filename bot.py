@@ -1288,7 +1288,7 @@ async def group_delete(callback: types.CallbackQuery):
     cursor.execute("DELETE FROM user_groups WHERE group_id = ?", (group_id,))
     conn.commit()
     await callback.answer("Группы удалены!")
-    await my_groups(callback))
+    await my_groups(callback)
 
 
 # ==========================================
