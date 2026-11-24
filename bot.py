@@ -218,6 +218,10 @@ def get_main_menu_text(user):
 
 
 async def edit_menu(callback: types.CallbackQuery, photo_url: str, text: str, keyboard: InlineKeyboardMarkup):
+    # Обрезаем текст, если он слишком длинный (защита от падения)
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+        
     try:
         await callback.message.edit_media(media=InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"), reply_markup=keyboard)
         return
@@ -234,7 +238,10 @@ async def edit_menu(callback: types.CallbackQuery, photo_url: str, text: str, ke
         if "profile" in photo_url.lower(): local_path = "images/profile.jpg"
         elif "robot" in photo_url.lower(): local_path = "images/robot.jpg"
         elif "tariff" in photo_url.lower(): local_path = "images/tariffs.jpg"
-        await callback.message.answer_photo(FSInputFile(local_path), caption=text, reply_markup=keyboard, parse_mode="HTML")
+        try:
+            await callback.message.answer_photo(FSInputFile(local_path), caption=text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 # ==========================================
@@ -1256,9 +1263,22 @@ async def group_view(callback: types.CallbackQuery):
     group_id = int(callback.data.split("_")[2])
     cursor.execute("SELECT title, chat_link FROM user_groups WHERE group_id = ?", (group_id,))
     g = cursor.fetchone()
+    
+    if not g:
+        return await callback.answer("Группа не найдена.", show_alert=True)
+        
+    links = [link.strip() for link in g["chat_link"].split(',') if link.strip()]
+    count = len(links)
+    
+    # Показываем только первые 5 ссылок, чтобы не превысить лимит Telegram
+    preview = "\n".join(links[:5])
+    if count > 5:
+        preview += f"\n... и еще {count - 5} чатов."
+
     kb = [[InlineKeyboardButton(text="🗑 Удалить группу", callback_data=f"group_del_{group_id}", style="danger")],
           [InlineKeyboardButton(text="🔙 Назад к группам", callback_data="my_groups", style="danger")]]
-    text = f"🔗 <b>{g['title']}</b>\n\n<code>{g['chat_link']}</code>"
+          
+    text = f"🔗 <b>{g['title']}</b>\n\nВсего чатов: <b>{count}</b>\n\n<code>{preview}</code>"
     await edit_menu(callback, URL_MENU, text, InlineKeyboardMarkup(inline_keyboard=kb))
 
 
@@ -1268,7 +1288,7 @@ async def group_delete(callback: types.CallbackQuery):
     cursor.execute("DELETE FROM user_groups WHERE group_id = ?", (group_id,))
     conn.commit()
     await callback.answer("Группы удалены!")
-    await my_groups(callback)
+    await my_groups(callback))
 
 
 # ==========================================
