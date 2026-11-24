@@ -20,13 +20,24 @@ from config import (
 )
 import mailer
 
+# ==========================================
+# НАСТРОЙКА ПУТЕЙ ДЛЯ ХОСТИНГА (Bothost)
+# ==========================================
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "users.db")
+SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
+QR_DIR = os.path.join(DATA_DIR, "qr_codes")
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(QR_DIR, exist_ok=True)
+
 CRYPTO_PAY_API = "https://pay.crypt.bot/api/"
 TERMS_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-11-15-41"
 PRIVACY_URL = "https://telegra.ph/Politika-konfidencialnosti-11-15-78"
-URL_MENU = "https://ibb.co/dsvxysVj"
-URL_PROFILE = "https://ibb.co/KjBYKQYX"
-URL_ROBOT = "https://ibb.co/v4Zns1Nw"
-URL_TARIFFS = "https://ibb.co/qSV1FXv"
+URL_MENU = "https://ibb.co/Ldr7DPjC"
+URL_PROFILE = "https://ibb.co/bRPXrn8g"
+URL_ROBOT = "https://ibb.co/GvrTY1dv"
+URL_TARIFFS = "https://ibb.co/k27HHCGK"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -36,7 +47,7 @@ dp = Dispatcher()
 # ==========================================
 # БАЗА
 # ==========================================
-conn = sqlite3.connect("users.db")
+conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row  # Включаем доступ по имени столбца
 cursor = conn.cursor()
 cursor.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -84,8 +95,12 @@ class BotStates(StatesGroup):
     auth_phone = State(); auth_code = State(); auth_2fa = State(); auth_qr_scan = State()
     promo_wait = State()
     post_add_title = State(); post_add_content = State()
-    group_add_name = State()  # <-- Новое состояние для названия группы
+    
+    group_menu_wait = State()
+    group_add_name = State()
     group_add_value = State()
+    group_add_folder = State()
+    
     campaign_select_group = State()
     campaign_limit = State(); campaign_delay = State(); campaign_delay_round = State(); campaign_confirm = State()
     parser_keyword = State()
@@ -228,11 +243,18 @@ async def edit_menu(callback: types.CallbackQuery, photo_url: str, text: str, ke
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    await safe_delete(message)
     user = get_user(message.from_user.id)
     user_id = message.from_user.id
     
-    # Теперь проверяем по имени столбца!
+    cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = ?", (user_id,))
+    is_new = cursor.fetchone()[0] == 0
+
+    if is_new:
+        try:
+            await message.answer_dice(emoji="👋")
+        except:
+            pass
+
     if user["sub1"] == 1:
         caption = get_main_menu_text(user)
         try:
@@ -271,7 +293,7 @@ async def check_sub1(callback: types.CallbackQuery):
 async def back_menu(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id in mailer.qr_logins:
         del mailer.qr_logins[callback.from_user.id]
-    qr_file = f"qr_codes/qr_{callback.from_user.id}.png"
+    qr_file = os.path.join(QR_DIR, f"qr_{callback.from_user.id}.png")
     if os.path.exists(qr_file):
         try: os.remove(qr_file)
         except: pass
@@ -1093,7 +1115,7 @@ async def my_groups(callback: types.CallbackQuery):
     kb = []
     for g in groups:
         kb.append([InlineKeyboardButton(text=f"🔗 {g['title']}", callback_data=f"group_view_{g['group_id']}")])
-    kb.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="group_add", style="success")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="group_add_choice", style="success")])
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_menu", style="danger")])
     
     if groups:
@@ -1104,8 +1126,68 @@ async def my_groups(callback: types.CallbackQuery):
     await edit_menu(callback, URL_MENU, text, InlineKeyboardMarkup(inline_keyboard=kb))
 
 
-@dp.callback_query(F.data == "group_add")
-async def group_add(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "group_add_choice")
+async def group_add_choice(callback: types.CallbackQuery, state: FSMContext):
+    await safe_delete(callback.message)
+    await send_step(callback.message.chat.id, state,
+                    "📋 <b>Как вы хотите добавить группы?</b>\n\n"
+                    "📁 <b>Из папки Telegram:</b> Бот возьмет готовые чаты из вашей папки (быстро и удобно).\n"
+                    "🔗 <b>Вручную:</b> Вы отправите ссылки на чаты списком.",
+                    kb=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📁 Добавить из папки Telegram", callback_data="group_add_folder", style="primary")],
+                        [InlineKeyboardButton(text="🔗 Добавить ссылки вручную", callback_data="group_add_manual", style="success")],
+                        [InlineKeyboardButton(text="❌ Отмена", callback_data="back_menu", style="danger")]
+                    ]))
+    await state.set_state(BotStates.group_menu_wait)
+
+
+# ВАРИАНТ 1: ДОБАВЛЕНИЕ ИЗ ПАПКИ
+@dp.callback_query(F.data == "group_add_folder")
+async def group_add_folder(callback: types.CallbackQuery, state: FSMContext):
+    if not await mailer.is_authorized(callback.from_user.id):
+        return await callback.answer("⚠️ Сначала подключите аккаунт в разделе «Профиль»!", show_alert=True)
+    
+    cursor.execute("SELECT COUNT(*) FROM user_groups WHERE user_id = ?", (callback.from_user.id,))
+    if cursor.fetchone()[0] >= 100:
+        return await callback.answer("⚠️ Достигнут лимит! Максимум 100 групп/папок.", show_alert=True)
+
+    await safe_delete(callback.message)
+    await send_step(callback.message.chat.id, state,
+                    "📁 <b>Добавление из папки</b>\n\n"
+                    "Введите название папки, которую вы создали в Telegram (например: <i>Работа</i> или <i>Мои чаты</i>):\n\n"
+                    "⚠️ <i>Бот возьмет оттуда до 100 чатов.</i>",
+                    kb=get_cancel_kb())
+    await state.set_state(BotStates.group_add_folder)
+
+
+@dp.message(BotStates.group_add_folder)
+async def group_process_folder(message: types.Message, state: FSMContext):
+    await safe_delete(message)
+    folder_name = message.text.strip()
+    
+    await edit_step(message.chat.id, state, f"⏳ Ищу папку '{folder_name}' в вашем аккаунте...", kb=None)
+    
+    res = await mailer.get_chats_from_folder(message.from_user.id, folder_name)
+    if res["status"] == "ok":
+        chats = res["chats"]
+        combined_links = ", ".join(chats)
+        
+        cursor.execute("INSERT INTO user_groups (user_id, title, chat_link, type) VALUES (?, ?, ?, ?)",
+                       (message.from_user.id, f"📁 {folder_name}", combined_links, "folder"))
+        conn.commit()
+        
+        await edit_step(message.chat.id, state, 
+                        f"✅ <b>Группа '{folder_name}' успешно добавлена!</b>\n\n"
+                        f"🔗 Взято чатов: {len(chats)} (максимум 100)", 
+                        kb=get_back_kb())
+    else:
+        await edit_step(message.chat.id, state, f"❌ <b>Ошибка:</b> {res['msg']}", kb=get_back_kb())
+    await state.clear()
+
+
+# ВАРИАНТ 2: ДОБАВЛЕНИЕ ВРУЧНУЮ
+@dp.callback_query(F.data == "group_add_manual")
+async def group_add_manual(callback: types.CallbackQuery, state: FSMContext):
     cursor.execute("SELECT COUNT(*) FROM user_groups WHERE user_id = ?", (callback.from_user.id,))
     count = cursor.fetchone()[0]
     if count >= 100:
@@ -1232,7 +1314,7 @@ async def campaign_post_selected(callback: types.CallbackQuery, state: FSMContex
     cursor.execute("SELECT group_id, title FROM user_groups WHERE user_id = ?", (callback.from_user.id,))
     groups = cursor.fetchall()
     if not groups:
-        return await callback.answer("У вас нет сохранённых групп!", show_alert=True)
+        return await callback.answer("У вас нет сохранённых групп! Сначала создайте их в разделе «Мои группы».", show_alert=True)
 
     kb = []
     for g in groups:
@@ -1252,30 +1334,31 @@ async def campaign_toggle_group(callback: types.CallbackQuery, state: FSMContext
     data = await state.get_data()
     selected = data.get("selected_groups", [])
     
-    # Если группа уже выбрана - убираем её
     if group_id in selected:
         selected.remove(group_id)
         await state.update_data(selected_groups=selected)
     else:
-        # Считаем общее количество чатов в уже выбранных группах
-        current_total_links = 0
-        if selected:
-            placeholders = ','.join('?' * len(selected))
-            cursor.execute(f"SELECT chat_link FROM user_groups WHERE group_id IN ({placeholders})", selected)
-            for row in cursor.fetchall():
-                current_total_links += len([l.strip() for l in row["chat_link"].split(',') if l.strip()])
-                
-        # Считаем чаты в новой группе
-        cursor.execute("SELECT chat_link FROM user_groups WHERE group_id = ?", (group_id,))
-        new_row = cursor.fetchone()
-        new_group_links = len([l.strip() for l in new_row["chat_link"].split(',') if l.strip()]) if new_row else 0
-        
-        if current_total_links + new_group_links > 7:
-            return await callback.answer(
-                f"⚠️ Лимит! Максимум 7 чатов на 1 рассылку.\n"
-                f"Выбрано: {current_total_links}. В этой группе: {new_group_links}.",
-                show_alert=True
-            )
+        # Получаем тип группы (папка или ручная)
+        cursor.execute("SELECT chat_link, type FROM user_groups WHERE group_id = ?", (group_id,))
+        row = cursor.fetchone()
+        group_type = row["type"]
+        new_group_links = len([l.strip() for l in row["chat_link"].split(',') if l.strip()])
+
+        # Если это РУЧНАЯ группа, проверяем общий лимит 7
+        if group_type == "links":
+            current_total_links = 0
+            if selected:
+                placeholders = ','.join('?' * len(selected))
+                cursor.execute(f"SELECT chat_link FROM user_groups WHERE group_id IN ({placeholders})", selected)
+                for r in cursor.fetchall():
+                    current_total_links += len([l.strip() for l in r["chat_link"].split(',') if l.strip()])
+                    
+            if current_total_links + new_group_links > 7:
+                return await callback.answer(
+                    f"⚠️ Лимит! Максимум 7 чатов для ручных групп.\n"
+                    f"Выбрано: {current_total_links}. В этой группе: {new_group_links}.",
+                    show_alert=True
+                )
             
         selected.append(group_id)
         await state.update_data(selected_groups=selected)
@@ -1309,14 +1392,11 @@ async def campaign_start_selected(callback: types.CallbackQuery, state: FSMConte
     all_links = [link.strip() for link in all_links if link.strip()]
     total_chats = len(all_links)
 
-    if total_chats > 7:
-        return await callback.answer(f"⚠️ Превышен лимит! Максимум 7 чатов в одной рассылке. У вас: {total_chats}.", show_alert=True)
-
     combined_links = ",".join(all_links)
     await state.update_data(camp_group_value=combined_links, total_chats=total_chats)
 
     body = (f"✅ Выбрано групп: <b>{len(selected)}</b>\n"
-            f"💬 Всего чатов: <b>{total_chats} из 7</b>\n\n"
+            f"💬 Всего чатов: <b>{total_chats}</b>\n\n"
             f"Сколько кругов сделать? (введите число)")
     await callback.message.edit_text(
         campaign_card(3, 5, "Количество кругов", body),
@@ -1351,7 +1431,13 @@ async def campaign_delay(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
         await edit_step(message.chat.id, state, campaign_card(4, 5, "Задержка между чатами", "❌ Введите число:"), kb=get_cancel_kb())
         return
-    await state.update_data(camp_delay=int(message.text))
+        
+    delay = int(message.text)
+    if delay < 5:
+        await edit_step(message.chat.id, state, campaign_card(4, 5, "Задержка между чатами", "⚠️ Минимум 5 секунд!"), kb=get_cancel_kb())
+        return
+        
+    await state.update_data(camp_delay=delay)
     await edit_step(message.chat.id, state, campaign_card(5, 5, "Задержка между кругами", "⏱ Задержка между кругами (сек, минимум 60):"), kb=get_cancel_kb())
     await state.set_state(BotStates.campaign_delay_round)
 

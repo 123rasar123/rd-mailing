@@ -15,16 +15,21 @@ from telethon.errors import (
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# ==========================================
+# НАСТРОЙКА ПУТЕЙ ДЛЯ ХОСТИНГА (Bothost)
+# ==========================================
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
+QR_DIR = os.path.join(DATA_DIR, "qr_codes")
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(QR_DIR, exist_ok=True)
+
 # ⚠️ Если 2040 не работает, попробуй 2496 или получи свои на my.telegram.org ⚠️
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
 MAX_BROADCASTS_PER_USER = 3
-
-if not os.path.exists("sessions"):
-    os.makedirs("sessions")
-if not os.path.exists("qr_codes"):
-    os.makedirs("qr_codes")
 
 active_clients = {}
 code_hashes = {}
@@ -109,7 +114,7 @@ async def render_progress(user_id, bid):
 
 
 async def get_client(user_id):
-    session_path = f"sessions/user_{user_id}"
+    session_path = os.path.join(SESSIONS_DIR, f"user_{user_id}")
     if user_id in active_clients:
         client = active_clients[user_id]
         if not client.is_connected():
@@ -196,7 +201,7 @@ async def get_qr(user_id):
             del qr_logins[user_id]
         qr_login = await client.qr_login()
         qr_logins[user_id] = qr_login
-        img_path = f"qr_codes/qr_{user_id}.png"
+        img_path = os.path.join(QR_DIR, f"qr_{user_id}.png")
         img = qrcode.make(qr_login.url)
         img.save(img_path)
         return {"status": "ok", "path": img_path, "url": qr_login.url}
@@ -221,6 +226,46 @@ async def check_qr(user_id):
         return {"status": "error", "msg": str(e)}
 
 
+async def get_chats_from_folder(user_id, folder_name):
+    """Берет чаты из папки Telegram (Dialog Filters)"""
+    client = active_clients.get(user_id)
+    if not client or not await client.is_user_authorized():
+        return {"status": "error", "msg": "Аккаунт не подключен"}
+    try:
+        result = await client(functions.messages.GetDialogFiltersRequest())
+        target = next((f for f in result.filters if hasattr(f, 'title') and (f.title.text if hasattr(f.title, 'text') else str(f.title)).lower() == folder_name.lower()), None)
+        
+        if not target:
+            return {"status": "error", "msg": f"Папка '{folder_name}' не найдена. Создайте её в Telegram."}
+        
+        found_chats = []
+        # Берем до 100 чатов из папки
+        for peer in target.include_peers[:100]:
+            try:
+                entity = await client.get_entity(peer)
+                
+                # Если есть юзернейм - берем его
+                if hasattr(entity, 'username') and entity.username:
+                    found_chats.append(f"@{entity.username}")
+                # Если приватный - пытаемся получить инвайт-ссылку
+                elif hasattr(entity, 'id'):
+                    try:
+                        invite = await client(functions.messages.ExportChatInviteRequest(peer=entity))
+                        found_chats.append(invite.link)
+                    except Exception:
+                        # Если нельзя получить ссылку (например, мы не админ) - пропускаем
+                        pass
+            except Exception:
+                pass
+                
+        if not found_chats:
+            return {"status": "error", "msg": "В папке не найдено доступных чатов (ни публичных, ни с инвайт-ссылками)."}
+            
+        return {"status": "ok", "chats": found_chats}
+    except Exception as e:
+        return {"status": "error", "msg": _humanize_error(e)}
+
+
 async def save_post_to_saved_messages(user_id, text, media_msg=None):
     client = await get_client(user_id)
     if not await client.is_user_authorized():
@@ -228,7 +273,7 @@ async def save_post_to_saved_messages(user_id, text, media_msg=None):
     try:
         if media_msg and aiogram_bot:
             file_id = None
-            temp_path = f"temp_post_{user_id}"
+            temp_path = os.path.join(DATA_DIR, f"temp_post_{user_id}")
             if media_msg.photo:
                 file_id = media_msg.photo[-1].file_id
                 temp_path += ".jpg"
@@ -268,14 +313,22 @@ async def run_campaign(user_id, broadcast_id, post_msg_id, target_data,
 
     try:
         entities = []
+        # Безопасный сбор сущностей
         for link in target_data["value"].split(','):
+            link = link.strip()
+            if not link:
+                continue
             try:
-                entity = await client.get_entity(link.strip())
+                # Пытаемся найти чат
+                entity = await client.get_entity(link)
                 entities.append(entity)
-            except Exception:
+            except Exception as e:
+                # Если чат не найден или битая ссылка - просто пропускаем
+                print(f"Не удалось найти чат {link}: {e}")
                 pass
+                
         if not entities:
-            return {"status": "error", "msg": "Не удалось найти ни одного чата из списка."}
+            return {"status": "error", "msg": "Не удалось найти ни одного чата из списка. Возможно, ссылки битые или чаты приватные."}
 
         total_success = 0
         total_fail = 0
