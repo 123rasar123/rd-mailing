@@ -15,7 +15,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 from config import (
     BOT_TOKEN, ADMIN_ID,
-    CHANNEL_1_URL, CHANNEL_1_USERNAME,
     CRYPTO_PAY_TOKEN,
 )
 import mailer
@@ -163,10 +162,9 @@ def campaign_card(step: int, total: int, title: str, body: str) -> str:
 # ==========================================
 def get_sub1_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1️⃣ Подписаться на новости", url=CHANNEL_1_URL)],
         [InlineKeyboardButton(text="📜 Пользовательское соглашение", url=TERMS_URL)],
         [InlineKeyboardButton(text="🛡 Политика конфиденциальности", url=PRIVACY_URL)],
-        [InlineKeyboardButton(text="✅ Я подписался и принимаю условия", callback_data="check_sub1", style="success")],
+        [InlineKeyboardButton(text="✅ Я принимаю условия", callback_data="check_sub1", style="success")],
     ])
 
 
@@ -218,10 +216,6 @@ def get_main_menu_text(user):
 
 
 async def edit_menu(callback: types.CallbackQuery, photo_url: str, text: str, keyboard: InlineKeyboardMarkup):
-    # Обрезаем текст, если он слишком длинный (защита от падения)
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-        
     try:
         await callback.message.edit_media(media=InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"), reply_markup=keyboard)
         return
@@ -238,10 +232,7 @@ async def edit_menu(callback: types.CallbackQuery, photo_url: str, text: str, ke
         if "profile" in photo_url.lower(): local_path = "images/profile.jpg"
         elif "robot" in photo_url.lower(): local_path = "images/robot.jpg"
         elif "tariff" in photo_url.lower(): local_path = "images/tariffs.jpg"
-        try:
-            await callback.message.answer_photo(FSInputFile(local_path), caption=text, reply_markup=keyboard, parse_mode="HTML")
-        except Exception:
-            await callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        await callback.message.answer_photo(FSInputFile(local_path), caption=text, reply_markup=keyboard, parse_mode="HTML")
 
 
 # ==========================================
@@ -269,7 +260,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         except:
             await message.answer_photo(FSInputFile("images/menu.jpg"), caption=caption, reply_markup=get_main_menu(user_id), parse_mode="HTML")
         return
-    text = f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\nЭто <b>RD Mailing</b>.\n\n⚠️ Подпишитесь на канал и примите условия:"
+    text = f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\nЭто <b>RD Mailing</b>.\n\n⚠️ Примите условия, чтобы продолжить:"
     try:
         await message.answer_photo(URL_ROBOT, caption=text, reply_markup=get_sub1_kb(), parse_mode="HTML")
     except:
@@ -279,21 +270,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "check_sub1")
 async def check_sub1(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    chat_id = CHANNEL_1_USERNAME
-    if not chat_id.startswith("@") and not chat_id.startswith("-"):
-        chat_id = f"@{chat_id}"
-
-    try:
-        member1 = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        if member1.status in ["member", "administrator", "creator", "restricted"]:
-            cursor.execute("UPDATE users SET sub1 = 1 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            user = get_user(user_id)
-            await edit_menu(callback, URL_MENU, get_main_menu_text(user), get_main_menu(user_id))
-        else:
-            await callback.answer(f"❌ Вы не подписаны! (Статус: {member1.status})", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
+    get_user(user_id)
+    cursor.execute("UPDATE users SET sub1 = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    user = get_user(user_id)
+    await edit_menu(callback, URL_MENU, get_main_menu_text(user), get_main_menu(user_id))
 
 
 @dp.callback_query(F.data == "back_menu")
@@ -1263,22 +1244,9 @@ async def group_view(callback: types.CallbackQuery):
     group_id = int(callback.data.split("_")[2])
     cursor.execute("SELECT title, chat_link FROM user_groups WHERE group_id = ?", (group_id,))
     g = cursor.fetchone()
-    
-    if not g:
-        return await callback.answer("Группа не найдена.", show_alert=True)
-        
-    links = [link.strip() for link in g["chat_link"].split(',') if link.strip()]
-    count = len(links)
-    
-    # Показываем только первые 5 ссылок, чтобы не превысить лимит Telegram
-    preview = "\n".join(links[:5])
-    if count > 5:
-        preview += f"\n... и еще {count - 5} чатов."
-
     kb = [[InlineKeyboardButton(text="🗑 Удалить группу", callback_data=f"group_del_{group_id}", style="danger")],
           [InlineKeyboardButton(text="🔙 Назад к группам", callback_data="my_groups", style="danger")]]
-          
-    text = f"🔗 <b>{g['title']}</b>\n\nВсего чатов: <b>{count}</b>\n\n<code>{preview}</code>"
+    text = f"🔗 <b>{g['title']}</b>\n\n<code>{g['chat_link']}</code>"
     await edit_menu(callback, URL_MENU, text, InlineKeyboardMarkup(inline_keyboard=kb))
 
 
